@@ -9,11 +9,10 @@ import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
 import random
-import itertools
+import argparse
 import time
-from batzzang.lazy_modules import LazyGRU, LazyEmbedding, LazyLinear, LazyGRUCell, LazyAttention
+from batzzang.lazy_modules import LazyGRU, LazyEmbedding, LazyLinear, LazyAttention
 from batzzang.monad import ForEachState, While, If, Do
-from batzzang.tensor_promise import TensorPromise
 from load_and_trim_data import EOS_token, PAD_token, SOS_token, MAX_LENGTH, loadPrepareData, trimRareWords
 from create_formatted_data_file import create_formatted_data_file
 
@@ -62,18 +61,21 @@ class StateTeacherForcing:
         self.loss = 0
 
 
-class GRUSeq2SeqWithAttention(nn.Module):
-    def __init__(self, vocab_num, hidden_size, encoder_layers, decoder_layers, dropout):
-        super(GRUSeq2SeqWithAttention, self).__init__()
+class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
+    def __init__(self, vocab_num, hidden_size, layer_num, dropout):
+        super(GRUSeq2SeqWithAttentionWithBatzzang, self).__init__()
         self.embedding = LazyEmbedding(vocab_num, hidden_size, dropout)
-        self.encoder_gru = LazyGRU(hidden_size, hidden_size, encoder_layers, bidirection=True)
-        self.decoder_gru = LazyGRU(hidden_size, hidden_size, decoder_layers, bidirection=False)
+        self.encoder_gru = LazyGRU(hidden_size, hidden_size, layer_num,
+                                   dropout=(0 if layer_num == 1 else dropout), bidirection=True)
+        self.decoder_gru = LazyGRU(hidden_size, hidden_size, layer_num,
+                                   dropout=(0 if layer_num == 1 else dropout), bidirection=False)
+        self.layer_num = layer_num
         self.att = LazyAttention(hidden_size, 'dot')
         self.out = LazyLinear(hidden_size, vocab_num)
         self.hidden_size = hidden_size
         self.loss = nn.CrossEntropyLoss()
 
-    def forward(self, input_seq_batch, target_seq_batch):
+    def forward_no_teacher_forcing(self, input_seq_batch, target_seq_batch):
         states = [
             State(input_seq, target_seq)
             for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)
@@ -94,7 +96,7 @@ class GRUSeq2SeqWithAttention(nn.Module):
                 encoder_promise = previous_output
                 encoder_output, encoder_hidden = encoder_promise.result
                 encoder_output = encoder_output[:, :self.hidden_size] + encoder_output[:, self.hidden_size:]
-                decoder_hidden = encoder_hidden[-1, 0] + encoder_hidden[-1, 1]
+                decoder_hidden = encoder_hidden[:, 0] + encoder_hidden[:, 1]
                 decoder_input = state.decoder_input_token
             else:
                 encoder_output, decoder_hidden = previous_output
@@ -143,7 +145,7 @@ class GRUSeq2SeqWithAttention(nn.Module):
             )
         ).states
 
-        return sum([state.loss / state.decoding_cnt for state in result_states]) / len(states)
+        return sum([state.loss / state.decoding_cnt for state in result_states])
 
     def forward_teacher_forcing(self, input_seq_batch, target_seq_batch):
         states = [
@@ -161,8 +163,9 @@ class GRUSeq2SeqWithAttention(nn.Module):
         def embed_decoder_input(state: StateTeacherForcing, previous_output):
             encoder_promise = previous_output
             encoder_output, encoder_hidden = encoder_promise.result
+
             encoder_output = encoder_output[:, :self.hidden_size] + encoder_output[:, self.hidden_size:]
-            decoder_hidden = encoder_hidden[-1, 0] + encoder_hidden[-1, 1]
+            decoder_hidden = encoder_hidden[:, 0] + encoder_hidden[:, 1]
             decoder_input = state.decoder_input
 
             decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
@@ -200,18 +203,18 @@ class GRUSeq2SeqWithAttention(nn.Module):
         ).states
 
 
-        return sum([state.loss for state in result_states]) / len(states)
+        return sum([state.loss for state in result_states])
 
 
-def train(input_seq_batch, target_seq_batch, model, optimizer, clip):
+def train(input_seq_batch, target_seq_batch, model, optimizer, clip, no_teacher_forcing):
 
     # Zero gradients
     optimizer.zero_grad()
 
-    # Initialize variables
-    losses = []
-
-    loss = model.forward_teacher_forcing(input_seq_batch, target_seq_batch)
+    if no_teacher_forcing:
+        loss = model.forward_no_teacher_forcing(input_seq_batch, target_seq_batch)
+    else:
+        loss = model.forward_teacher_forcing(input_seq_batch, target_seq_batch)
 
     # Perform backpropatation
     loss.backward()
@@ -221,12 +224,11 @@ def train(input_seq_batch, target_seq_batch, model, optimizer, clip):
 
     # Adjust model weights
     optimizer.step()
-    losses.append(float(loss))
 
-    return sum(losses) / len(losses)
+    return float(loss) / len(input_seq_batch)
 
 
-def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip):
+def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, no_teacher_forcing):
 
     # Load batches for each iteration
     training_batches = [batch2TrainData(voc, [random.choice(pairs) for _ in range(batch_size)])
@@ -246,8 +248,8 @@ def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_ever
         input_variable, target_variable = training_batch
 
         # Run a training iteration with batch
-        loss = train(input_variable, target_variable, model, optimizer, clip)
-        print_loss += loss
+        avg_loss = train(input_variable, target_variable, model, optimizer, clip, no_teacher_forcing)
+        print_loss += avg_loss
 
         # Print progress
         if iteration % print_every == 0:
@@ -257,31 +259,37 @@ def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_ever
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', choices=['gru', 'transformer', 'bert'])
+    parser.add_argument('--no_teacher_forcing', action='store_true')
+    args = parser.parse_args()
+
     create_formatted_data_file()
     voc, pairs = loadPrepareData()
 
-    # Configure models
+    # Configurations
     hidden_size = 500
-    encoder_n_layers = 2
-    decoder_n_layers = 2
+    layer_num = 2
     dropout = 0.1
     batch_size = 64
-
-    print('Building model ...')
-    model = GRUSeq2SeqWithAttention(voc.num_words, hidden_size, encoder_n_layers, decoder_n_layers, dropout)
-
-    # Use appropriate device
-    model = model.to(device)
-    print('Models built and ready to go!')
-
-    # Configure training/optimization
     clip = 50.0
     learning_rate = 0.0001
     n_iteration = 4000
     print_every = 1
 
-    # Ensure dropout layers are in train mode
+    print('Building model ...')
+    if args.model == 'gru':
+        model = GRUSeq2SeqWithAttentionWithBatzzang(voc.num_words, hidden_size, layer_num, dropout)
+    elif args.model == 'transformer':
+        assert False, 'need impementation'
+    else:
+        assert args.model == 'bert'
+        assert False, 'need implementation'
+
+    # Use appropriate device
+    model = model.to(device)
     model.train()
+    print('Models built and ready to go!')
 
     # Initialize optimizers
     print('Building optimizers ...')
@@ -295,7 +303,7 @@ def main():
 
     # Run training iterations
     print("Starting Training!")
-    trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip)
+    trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, args.no_teacher_forcing)
 
 
 if __name__ == "__main__":

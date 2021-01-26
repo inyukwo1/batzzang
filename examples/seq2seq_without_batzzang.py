@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import random
 import itertools
 import time
+import argparse
 from load_and_trim_data import EOS_token, PAD_token, SOS_token, MAX_LENGTH, loadPrepareData, trimRareWords
 from create_formatted_data_file import create_formatted_data_file
 
@@ -44,7 +45,7 @@ def inputVar(l, voc):
     indexes_batch = [indexesFromSentence(voc, sentence) for sentence in l]
     lengths = torch.tensor([len(indexes) for indexes in indexes_batch])
     padList = zeroPadding(indexes_batch)
-    padVar = torch.LongTensor(padList)
+    padVar = torch.LongTensor(padList).to(device)
     return padVar, lengths
 
 
@@ -54,8 +55,8 @@ def outputVar(l, voc):
     max_target_len = max([len(indexes) for indexes in indexes_batch])
     padList = zeroPadding(indexes_batch)
     mask = binaryMatrix(padList)
-    mask = torch.BoolTensor(mask)
-    padVar = torch.LongTensor(padList)
+    mask = torch.BoolTensor(mask).to(device)
+    padVar = torch.LongTensor(padList).to(device)
     return padVar, mask, max_target_len
 
 
@@ -69,33 +70,6 @@ def batch2TrainData(voc, pair_batch):
     inp, lengths = inputVar(input_batch, voc)
     output, mask, max_target_len = outputVar(output_batch, voc)
     return inp, lengths, output, mask, max_target_len
-
-
-class EncoderRNN(nn.Module):
-    def __init__(self, hidden_size, embedding, n_layers=1, dropout=0.):
-        super(EncoderRNN, self).__init__()
-        self.n_layers = n_layers
-        self.hidden_size = hidden_size
-        self.embedding = embedding
-
-        # Initialize GRU; the input_size and hidden_size params are both set to 'hidden_size'
-        #   because our input size is a word embedding with number of features == hidden_size
-        self.gru = nn.GRU(hidden_size, hidden_size, n_layers,
-                          dropout=(0 if n_layers == 1 else dropout), bidirectional=True)
-
-    def forward(self, input_seq, input_lengths, hidden=None):
-        # Convert word indexes to embeddings
-        embedded = self.embedding(input_seq)
-        # Pack padded batch of sequences for RNN module
-        packed = nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
-        # Forward pass through GRU
-        outputs, hidden = self.gru(packed, hidden)
-        # Unpack padding
-        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs)
-        # Sum bidirectional GRU outputs
-        outputs = outputs[:, :, :self.hidden_size] + outputs[:, : ,self.hidden_size:]
-        # Return output and final hidden state
-        return outputs, hidden
 
 
 # Luong attention layer
@@ -118,33 +92,42 @@ class Attn(nn.Module):
         return F.softmax(attn_energies, dim=1).unsqueeze(1)
 
 
-class LuongAttnDecoderRNN(nn.Module):
-    def __init__(self, embedding, hidden_size, n_layers, output_size, dropout=0.1):
-        super(LuongAttnDecoderRNN, self).__init__()
-
-        # Keep for reference
-        self.hidden_size = hidden_size
-        self.output_size = output_size
-        self.dropout = dropout
-        self.n_layers = n_layers
-
-        # Define layers
-        self.embedding = embedding
-        self.embedding_dropout = nn.Dropout(dropout)
-        self.gru = nn.GRU(hidden_size, hidden_size, n_layers,
-                          dropout=(0 if n_layers == 1 else dropout))
-        self.concat = nn.Linear(hidden_size * 2, hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
+class GRUSeq2SeqWithAttention(nn.Module):
+    def __init__(self, vocab_num, hidden_size, layer_num, dropout):
+        super(GRUSeq2SeqWithAttention, self).__init__()
+        self.embedding = nn.Embedding(vocab_num, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.encoder_gru = nn.GRU(hidden_size, hidden_size, layer_num,
+                                  dropout=(0 if layer_num == 1 else dropout), bidirectional=True)
+        self.decoder_gru = nn.GRU(hidden_size, hidden_size, layer_num,
+                                  dropout=(0 if layer_num == 1 else dropout), bidirectional=False)
 
         self.attn = Attn(hidden_size)
+        self.concat = nn.Linear(hidden_size * 2, hidden_size)
+        self.out = nn.Linear(hidden_size, vocab_num)
+        self.hidden_size = hidden_size
+        self.layer_num = layer_num
 
-    def forward(self, input_step, last_hidden, encoder_outputs):
+    def encode(self, input_variable, input_lengths):
+        embedded = self.embedding(input_variable)
+        embedded = self.dropout(embedded)
+        # Lengths for rnn packing should always be on the cpu
+        input_lengths = input_lengths.to("cpu")
+        # Pack padded batch of sequences for RNN module
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
+        encoder_outputs, encoder_hidden = self.encoder_gru(packed, None)
+        # Unpack padding
+        encoder_outputs, _ = nn.utils.rnn.pad_packed_sequence(encoder_outputs)
+        encoder_outputs = encoder_outputs[:, :, :self.hidden_size] + encoder_outputs[:, :, self.hidden_size:]
+        return encoder_outputs, encoder_hidden
+
+    def decode(self, decoder_input, decoder_hidden, encoder_outputs):
         # Note: we run this one step (word) at a time
         # Get embedding of current input word
-        embedded = self.embedding(input_step)
-        embedded = self.embedding_dropout(embedded)
+        embedded = self.embedding(decoder_input)
+        embedded = self.dropout(embedded)
         # Forward through unidirectional GRU
-        gru_output, hidden = self.gru(embedded, last_hidden)
+        gru_output, hidden = self.decoder_gru(embedded, decoder_hidden)
         # Calculate attention weights from the current GRU output
         attn_weights = self.attn(gru_output, encoder_outputs)
         # Multiply attention weights to encoder outputs to get new "weighted sum" context vector
@@ -159,6 +142,33 @@ class LuongAttnDecoderRNN(nn.Module):
         # Return output and final hidden state
         return output, hidden
 
+    def forward_no_teacher_forcing(self, input_variable, input_lengths, target_variable, mask, max_target_len):
+        encoder_outputs, encoder_hidden = self.encode(input_variable, input_lengths)
+        batch_size = len(input_lengths)
+
+        # Create initial decoder input (start with SOS tokens for each sentence)
+        decoder_input = torch.LongTensor([[SOS_token for _ in range(batch_size)]]).to(device)
+        encoder_hidden = encoder_hidden.view(self.layer_num, 2, batch_size, self.hidden_size)
+        decoder_hidden = encoder_hidden[:, 0] + encoder_hidden[:, 1]
+
+        loss = 0
+
+        for t in range(max_target_len):
+            decoder_output, decoder_hidden = self.decode(
+                decoder_input, decoder_hidden, encoder_outputs
+            )
+            # No Teacher forcing
+            _, topi = decoder_output.topk(1)
+
+            decoder_input = torch.LongTensor([[topi[i][0] for i in range(batch_size)]]).to(device)
+            # Calculate and accumulate loss
+            mask_loss, nTotal = maskNLLLoss(decoder_output, target_variable[t], mask[t])
+            loss += mask_loss
+        return loss
+
+    def forward_teacher_forcing(self, input_variable, input_lengths, target_variable, mask, max_target_len):
+        assert False, "TODO"
+
 
 def maskNLLLoss(inp, target, mask):
     nTotal = mask.sum()
@@ -168,67 +178,29 @@ def maskNLLLoss(inp, target, mask):
     return loss, nTotal.item()
 
 
-def train(input_variable, lengths, target_variable, mask, max_target_len, encoder, decoder, embedding,
-          encoder_optimizer, decoder_optimizer, batch_size, clip, max_length=MAX_LENGTH):
+def train(input_variable, input_lengths, target_variable, mask, max_target_len, model, optimizer, clip, no_teacher_forcing):
 
     # Zero gradients
-    encoder_optimizer.zero_grad()
-    decoder_optimizer.zero_grad()
+    optimizer.zero_grad()
 
-    # Set device options
-    input_variable = input_variable.to(device)
-    target_variable = target_variable.to(device)
-    mask = mask.to(device)
-    # Lengths for rnn packing should always be on the cpu
-    lengths = lengths.to("cpu")
-
-    # Initialize variables
-    loss = 0
-    print_losses = []
-    n_totals = 0
-
-    # Forward pass through encoder
-    encoder_outputs, encoder_hidden = encoder(input_variable, lengths)
-
-    # Create initial decoder input (start with SOS tokens for each sentence)
-    decoder_input = torch.LongTensor([[SOS_token for _ in range(batch_size)]])
-    decoder_input = decoder_input.to(device)
-
-    # Set initial decoder hidden state to the encoder's final hidden state
-    decoder_hidden = encoder_hidden[:decoder.n_layers]
-
-    # Determine if we are using teacher forcing this iteration
-
-    # Forward batch of sequences through decoder one time step at a time
-    for t in range(max_target_len):
-        decoder_output, decoder_hidden = decoder(
-            decoder_input, decoder_hidden, encoder_outputs
-        )
-        # No Teacher forcing
-        _, topi = decoder_output.topk(1)
-
-        decoder_input = torch.LongTensor([[topi[i][0] for i in range(batch_size)]]).to(device)
-        # Calculate and accumulate loss
-        mask_loss, nTotal = maskNLLLoss(decoder_output, target_variable[t], mask[t])
-        loss += mask_loss
-        print_losses.append(mask_loss.item() * nTotal)
-        n_totals += nTotal
+    if no_teacher_forcing:
+        loss = model.forward_no_teacher_forcing(input_variable, input_lengths, target_variable, mask, max_target_len)
+    else:
+        loss = model.forward_teacher_forcing(input_variable, input_lengths, target_variable, mask, max_target_len)
 
     # Perform backpropatation
     loss.backward()
 
     # Clip gradients: gradients are modified in place
-    _ = nn.utils.clip_grad_norm_(encoder.parameters(), clip)
-    _ = nn.utils.clip_grad_norm_(decoder.parameters(), clip)
+    _ = nn.utils.clip_grad_norm_(model.parameters(), clip)
 
     # Adjust model weights
-    encoder_optimizer.step()
-    decoder_optimizer.step()
+    optimizer.step()
 
-    return sum(print_losses) / n_totals
+    return float(loss) / max_target_len
 
 
-def trainIters(voc, pairs, encoder, decoder, encoder_optimizer, decoder_optimizer, embedding, n_iteration, batch_size, print_every, clip):
+def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, no_teacher_forcing):
 
     # Load batches for each iteration
     training_batches = [batch2TrainData(voc, [random.choice(pairs) for _ in range(batch_size)])
@@ -248,9 +220,8 @@ def trainIters(voc, pairs, encoder, decoder, encoder_optimizer, decoder_optimize
         input_variable, lengths, target_variable, mask, max_target_len = training_batch
 
         # Run a training iteration with batch
-        loss = train(input_variable, lengths, target_variable, mask, max_target_len, encoder,
-                     decoder, embedding, encoder_optimizer, decoder_optimizer, batch_size, clip)
-        print_loss += loss
+        avg_loss = train(input_variable, lengths, target_variable, mask, max_target_len, model, optimizer, clip, no_teacher_forcing)
+        print_loss += avg_loss
 
         # Print progress
         if iteration % print_every == 0:
@@ -260,58 +231,51 @@ def trainIters(voc, pairs, encoder, decoder, encoder_optimizer, decoder_optimize
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', choices=['gru', 'transformer', 'bert'])
+    parser.add_argument('--no_teacher_forcing', action='store_true')
+    args = parser.parse_args()
+
     create_formatted_data_file()
     voc, pairs = loadPrepareData()
 
-    # Configure models
+    # Configurations
     hidden_size = 500
-    encoder_n_layers = 8
-    decoder_n_layers = 8
+    layer_num = 2
     dropout = 0.1
     batch_size = 64
-
-    print('Building encoder and decoder ...')
-    # Initialize word embeddings
-    embedding = nn.Embedding(voc.num_words, hidden_size)
-    # Initialize encoder & decoder models
-    encoder = EncoderRNN(hidden_size, embedding, encoder_n_layers, dropout)
-    decoder = LuongAttnDecoderRNN(embedding, hidden_size, decoder_n_layers, voc.num_words, dropout)
-
-    # Use appropriate device
-    encoder = encoder.to(device)
-    decoder = decoder.to(device)
-    print('Models built and ready to go!')
-
-    # Configure training/optimization
     clip = 50.0
     learning_rate = 0.0001
     n_iteration = 4000
     print_every = 1
 
-    # Ensure dropout layers are in train mode
-    encoder.train()
-    decoder.train()
+    print('Building encoder and decoder ...')
+    if args.model == 'gru':
+        model = GRUSeq2SeqWithAttention(voc.num_words, hidden_size, layer_num, dropout)
+    elif args.model == 'transformer':
+        assert False, 'need impementation'
+    else:
+        assert args.model == 'bert'
+        assert False, 'need implementation'
+
+    # Initialize word embeddings
+    model = model.to(device)
+    model.train()
+    print('Models built and ready to go!')
 
     # Initialize optimizers
     print('Building optimizers ...')
-    encoder_optimizer = optim.Adam(encoder.parameters(), lr=learning_rate)
-    decoder_optimizer = optim.Adam(decoder.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
     # If you have cuda, configure cuda to call
-    for state in encoder_optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.cuda()
-
-    for state in decoder_optimizer.state.values():
+    for state in optimizer.state.values():
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.cuda()
 
     # Run training iterations
     print("Starting Training!")
-    trainIters(voc, pairs, encoder, decoder, encoder_optimizer, decoder_optimizer,
-               embedding, n_iteration, batch_size, print_every, clip)
+    trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, args.no_teacher_forcing)
 
 
 if __name__ == "__main__":

@@ -191,7 +191,7 @@ class LazyLSTM(nn.Module, LazyModule):
 
         # Sort
         input_len = [len(item) for item in input_list]
-        sorted_len, sorted_indices = torch.tensor(input_len).sort(0, descending=True)
+        sorted_len, sorted_indices = torch.tensor(input_len).to("cpu").sort(0, descending=True)
         sorted_data = stacked_input[sorted_indices]
 
         # Pass
@@ -257,13 +257,13 @@ class LazyGRUCell(nn.Module, LazyModule):
 
 
 class LazyGRU(nn.Module, LazyModule):
-    def __init__(self, in_dim, out_dim, n_layers, bidirection=True):
+    def __init__(self, in_dim, out_dim, n_layers, dropout, bidirection=True):
         super(LazyGRU, self).__init__()
         LazyModule.__init__(self)
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.module = nn.GRU(
-            in_dim, out_dim, n_layers, batch_first=True, bidirectional=bidirection
+            in_dim, out_dim, n_layers, batch_first=True, dropout=dropout, bidirectional=bidirection
         )
         self.bidirection = bidirection
 
@@ -278,7 +278,7 @@ class LazyGRU(nn.Module, LazyModule):
 
         # Sort
         input_len = [len(item) for item in input_list]
-        sorted_len, sorted_indices = torch.tensor(input_len).sort(0, descending=True)
+        sorted_len, sorted_indices = torch.tensor(input_len).to("cpu").sort(0, descending=True)
         sorted_data = stacked_input[sorted_indices]
 
         # Pass
