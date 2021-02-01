@@ -6,6 +6,7 @@ import math
 from .tensor_promise import TensorPromise
 from .utils import assert_dim, stack_sequential_tensor_with_mask
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+from transformers import BertModel, BertTokenizer
 import torch.nn.functional as F
 
 
@@ -309,6 +310,54 @@ class LazyGRU(nn.Module, LazyModule):
             ]
 
 
+class LazyTransformerEncoder(nn.Module, LazyModule):
+    def __init__(self, d_model, nhead, dim_feedforward, layer_num, dropout=0.1, activation='relu'):
+        super(LazyTransformerEncoder, self).__init__()
+        LazyModule.__init__(self)
+        decoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+                                                   dropout=dropout, activation=activation)
+        self.module = nn.TransformerEncoder(decoder_layer, num_layers=layer_num)
+        self.in_dim = d_model
+        self._init_positional_embedding()
+
+    def _init_positional_embedding(self, dropout=0.1, max_len=500):
+        d_model = self.in_dim
+
+        self.pos_dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer("pe", pe)
+
+    def _pos_encode(self, x):
+        x = x + self.pe[: x.size(0), :]
+        return self.pos_dropout(x)
+
+    def assert_input(self, *inputs):
+        src = inputs[0]
+        assert_dim([None, self.in_dim], src)
+
+    def compute(self):
+        src_list: List[torch.Tensor] = [src[0] for src in self.later_buffer]
+        stacked_src, src_padding_mask = stack_sequential_tensor_with_mask(src_list)
+        stacked_src_batch_second = stacked_src.transpose(0, 1)
+        pos_encoded_src_batch_second = self._pos_encode(stacked_src_batch_second)
+
+        out_batch_first = self.module(
+            pos_encoded_src_batch_second,
+            src_key_padding_mask=src_padding_mask,
+        ).transpose(0, 1)
+        self.done_buffer = [
+            out_batch_first[idx, : len(src_list[idx])]
+            for idx in range(len(self.later_buffer))
+        ]
+
+
 class LazyTransformerDecoder(nn.Module, LazyModule):
     def __init__(self, d_model, nhead, dim_feedforward, layer_num, dropout=0.1, activation='relu'):
         super(LazyTransformerDecoder, self).__init__()
@@ -527,3 +576,27 @@ class LazyMultiHeadAttention(nn.Module, LazyModule):
         out_representation = self.out_linear(new_representation.transpose(0, 1))
 
         self.done_buffer = [item for item in out_representation]
+
+
+class LazyBert(nn.Module, LazyModule):
+    def __init__(self):
+        super(LazyBert, self).__init__()
+        LazyModule.__init__(self)
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.model = BertModel.from_pretrained('bert-base-uncased')
+
+    def assert_input(self, *args):
+        pass
+
+    def compute(self):
+        src_list: List[torch.Tensor] = []
+        for src in self.later_buffer:
+            src_list.append(src[0])
+        stacked_src, src_padding_mask = stack_sequential_tensor_with_mask(src_list)
+
+        # src_mask = torch.nn.Transformer.generate_square_subsequent_mask(None, list(stacked_src_batch_second.size())[0]).cuda()
+        out_batch_first = self.model(stacked_src)['last_hidden_state']
+        self.done_buffer = [
+            out_batch_first[idx, : len(src_list[idx])]
+            for idx in range(len(self.later_buffer))
+        ]
