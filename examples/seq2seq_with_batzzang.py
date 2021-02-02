@@ -15,6 +15,7 @@ from batzzang.lazy_modules import LazyGRU, LazyEmbedding, LazyLinear, LazyAttent
 from batzzang.monad import ForEachState, While, If, Do
 from load_and_trim_data import EOS_token, PAD_token, SOS_token, MAX_LENGTH, loadPrepareData, trimRareWords
 from create_formatted_data_file import create_formatted_data_file
+from batzzang import timer
 
 
 USE_CUDA = torch.cuda.is_available()
@@ -485,7 +486,10 @@ def train(input_seq_batch, target_seq_batch, model, optimizer, clip, no_teacher_
     # Adjust model weights
     optimizer.step()
 
-    return float(loss) / len(input_seq_batch)
+    if hasattr(input_seq_batch, "data"):
+        return float(loss) / len(input_seq_batch.data['input_ids'])
+    else:
+        return float(loss) / len(input_seq_batch)
 
 
 def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, no_teacher_forcing):
@@ -564,7 +568,7 @@ def main():
     # Run training iterations
     print("Starting Training!")
     trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, args.no_teacher_forcing)
-
+    timer.Timer.show_elapsed_time()
 
 if __name__ == "__main__":
     main()

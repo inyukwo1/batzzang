@@ -7,7 +7,7 @@ from .tensor_promise import TensorPromise
 from .utils import assert_dim, stack_sequential_tensor_with_mask
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from transformers import BertModel, BertTokenizer
-import torch.nn.functional as F
+from . import timer
 
 
 class LazyModule(ABC):
@@ -69,13 +69,15 @@ class LazyEmbedding(nn.Module, LazyModule):
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx][: len(_tensor)] = _tensor
 
-            computed_tensors = self.dropout(self.module(stacked_tensors))
+            with timer.Pause():
+                computed_tensors = self.dropout(self.module(stacked_tensors))
 
             # Split
             self.done_buffer = [
                 computed_tensor[:length]
                 for length, computed_tensor in zip(tensor_length, computed_tensors)
             ]
+
         elif len(tensor_list[0].size()) == 0:
             stacked_tensors = torch.zeros(
                 len(tensor_list)
@@ -83,7 +85,8 @@ class LazyEmbedding(nn.Module, LazyModule):
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx] = _tensor
 
-            computed_tensors = self.dropout(self.module(stacked_tensors))
+            with timer.Pause():
+                computed_tensors = self.dropout(self.module(stacked_tensors))
 
             # Split
             self.done_buffer = [computed_tensor for computed_tensor in computed_tensors]
@@ -118,7 +121,8 @@ class LazyLinear(nn.Module, LazyModule):
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx][: len(_tensor)] = _tensor
 
-            computed_tensors = self.module(stacked_tensors)
+            with timer.Pause():
+                computed_tensors = self.module(stacked_tensors)
 
             # Split
             self.done_buffer = [
@@ -132,7 +136,8 @@ class LazyLinear(nn.Module, LazyModule):
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx] = _tensor
 
-            computed_tensors = self.module(stacked_tensors)
+            with timer.Pause():
+                computed_tensors = self.module(stacked_tensors)
 
             # Split
             self.done_buffer = [computed_tensor for computed_tensor in computed_tensors]
@@ -252,7 +257,8 @@ class LazyGRUCell(nn.Module, LazyModule):
         stacked_input = torch.stack(input_list)
         stacked_hidden = torch.stack(hidden_list)
 
-        next_hid = self.module(stacked_input, stacked_hidden)
+        with timer.Pause():
+            next_hid = self.module(stacked_input, stacked_hidden)
 
         self.done_buffer = [hid for hid in next_hid]
 
@@ -277,23 +283,25 @@ class LazyGRU(nn.Module, LazyModule):
         # Stack
         stacked_input, input_mask = stack_sequential_tensor_with_mask(input_list)
 
-        # Sort
-        input_len = [len(item) for item in input_list]
-        sorted_len, sorted_indices = torch.tensor(input_len).to("cpu").sort(0, descending=True)
-        sorted_data = stacked_input[sorted_indices]
+        with timer.Pause():
+            # Sort
+            input_len = [len(item) for item in input_list]
+            sorted_len, sorted_indices = torch.tensor(input_len).to("cpu").sort(0, descending=True)
+            sorted_data = stacked_input[sorted_indices]
 
-        # Pass
-        packed_data = pack_padded_sequence(sorted_data, sorted_len, batch_first=True)
-        packed_output, h_n = self.module(packed_data)
-        num_layers_direction, batch, hidden_size = list(h_n.size())
-        if self.bidirection:
-            h_n = h_n.view(num_layers_direction // 2, 2, batch, hidden_size)
-        packed_output, _ = pad_packed_sequence(packed_output, batch_first=True)
+            # Pass
+            packed_data = pack_padded_sequence(sorted_data, sorted_len, batch_first=True)
+            packed_output, h_n = self.module(packed_data)
+            num_layers_direction, batch, hidden_size = list(h_n.size())
+            if self.bidirection:
+                h_n = h_n.view(num_layers_direction // 2, 2, batch, hidden_size)
+            packed_output, _ = pad_packed_sequence(packed_output, batch_first=True)
 
-        # Unsort
-        new_indices = list(range(len(input_len)))
-        new_indices.sort(key=lambda k: sorted_indices[k])
-        encoded_data = packed_output[new_indices]
+            # Unsort
+            new_indices = list(range(len(input_len)))
+            new_indices.sort(key=lambda k: sorted_indices[k])
+            encoded_data = packed_output[new_indices]
+
         if self.bidirection:
             last_state = h_n[:, :, new_indices, :]
             # spread inputs
@@ -346,12 +354,15 @@ class LazyTransformerEncoder(nn.Module, LazyModule):
         src_list: List[torch.Tensor] = [src[0] for src in self.later_buffer]
         stacked_src, src_padding_mask = stack_sequential_tensor_with_mask(src_list)
         stacked_src_batch_second = stacked_src.transpose(0, 1)
-        pos_encoded_src_batch_second = self._pos_encode(stacked_src_batch_second)
 
-        out_batch_first = self.module(
-            pos_encoded_src_batch_second,
-            src_key_padding_mask=src_padding_mask,
-        ).transpose(0, 1)
+        with timer.Pause():
+            pos_encoded_src_batch_second = self._pos_encode(stacked_src_batch_second)
+
+            out_batch_first = self.module(
+                pos_encoded_src_batch_second,
+                src_key_padding_mask=src_padding_mask,
+            ).transpose(0, 1)
+
         self.done_buffer = [
             out_batch_first[idx, : len(src_list[idx])]
             for idx in range(len(self.later_buffer))
@@ -401,16 +412,18 @@ class LazyTransformerDecoder(nn.Module, LazyModule):
         stacked_mem, mem_padding_mask = stack_sequential_tensor_with_mask(mem_list)
         stacked_tgt_batch_second = stacked_tgt.transpose(0, 1)
         stacked_mem_batch_second = stacked_mem.transpose(0, 1)
-        pos_encoded_tgt_batch_second = self._pos_encode(stacked_tgt_batch_second)
-
         tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(None, list(stacked_tgt_batch_second.size())[0]).cuda()
-        out_batch_first = self.module(
-            pos_encoded_tgt_batch_second,
-            stacked_mem_batch_second,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_padding_mask,
-            memory_key_padding_mask=mem_padding_mask,
-        ).transpose(0, 1)
+
+        with timer.Pause():
+            pos_encoded_tgt_batch_second = self._pos_encode(stacked_tgt_batch_second)
+
+            out_batch_first = self.module(
+                pos_encoded_tgt_batch_second,
+                stacked_mem_batch_second,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_padding_mask,
+                memory_key_padding_mask=mem_padding_mask,
+            ).transpose(0, 1)
         self.done_buffer = [
             out_batch_first[idx, : len(tgt_list[idx])]
             for idx in range(len(self.later_buffer))
@@ -447,36 +460,38 @@ class LazyAttention(nn.Module, LazyModule):
         batch_size, output_len, dimensions = query.size()
         query_len = context.size(1)
 
-        if self.attention_type == "general":
-            query = query.reshape(batch_size * output_len, dimensions)
-            query = self.linear_in(query)
-            query = query.reshape(batch_size, output_len, dimensions)
+        with timer.Pause():
+            if self.attention_type == "general":
+                query = query.reshape(batch_size * output_len, dimensions)
+                query = self.linear_in(query)
+                query = query.reshape(batch_size, output_len, dimensions)
 
-        # (batch_size, output_len, dimensions) * (batch_size, query_len, dimensions) ->
-        # (batch_size, output_len, query_len)
-        attention_scores = torch.bmm(query, context.transpose(1, 2).contiguous())
+            # (batch_size, output_len, dimensions) * (batch_size, query_len, dimensions) ->
+            # (batch_size, output_len, query_len)
+            attention_scores = torch.bmm(query, context.transpose(1, 2).contiguous())
 
-        attention_scores.data.masked_fill_(q_mask.unsqueeze(2).bool(), float("-inf"))
-        attention_scores.data.masked_fill_(c_mask.unsqueeze(1).bool(), float("-inf"))
-        # Compute weights across every context sequence
-        attention_scores = attention_scores.view(batch_size * output_len, query_len)
-        attention_weights = self.softmax(attention_scores)
-        attention_weights = attention_weights.view(batch_size, output_len, query_len)
-        attention_weights.data.masked_fill_(c_mask.unsqueeze(1).bool(), 0.)
+            attention_scores.data.masked_fill_(q_mask.unsqueeze(2).bool(), float("-inf"))
+            attention_scores.data.masked_fill_(c_mask.unsqueeze(1).bool(), float("-inf"))
+            # Compute weights across every context sequence
+            attention_scores = attention_scores.view(batch_size * output_len, query_len)
+            attention_weights = self.softmax(attention_scores)
+            attention_weights = attention_weights.view(batch_size, output_len, query_len)
+            attention_weights.data.masked_fill_(c_mask.unsqueeze(1).bool(), 0.)
 
-        attention_weights.data.masked_fill_(q_mask.unsqueeze(2).bool(), 0.)
-        # (batch_size, output_len, query_len) * (batch_size, query_len, dimensions) ->
-        # (batch_size, output_len, dimensions)
-        mix = torch.bmm(attention_weights, context)
+            attention_weights.data.masked_fill_(q_mask.unsqueeze(2).bool(), 0.)
+            # (batch_size, output_len, query_len) * (batch_size, query_len, dimensions) ->
+            # (batch_size, output_len, dimensions)
+            mix = torch.bmm(attention_weights, context)
 
-        # concat -> (batch_size * output_len, 2*dimensions)
-        combined = torch.cat((mix, query), dim=2)
-        combined = combined.view(batch_size * output_len, 2 * dimensions)
+            # concat -> (batch_size * output_len, 2*dimensions)
+            combined = torch.cat((mix, query), dim=2)
+            combined = combined.view(batch_size * output_len, 2 * dimensions)
 
-        # Apply linear_out on every 2nd dimension of concat
-        # output -> (batch_size, output_len, dimensions)
-        output = self.linear_out(combined).view(batch_size, output_len, dimensions)
-        output = self.tanh(output)
+            # Apply linear_out on every 2nd dimension of concat
+            # output -> (batch_size, output_len, dimensions)
+            output = self.linear_out(combined).view(batch_size, output_len, dimensions)
+            output = self.tanh(output)
+
         self.done_buffer = [
             (output[i, :len(query_list[i])], attention_weights[i, :len(query_list[i])])
             for i in range(len(output))
@@ -594,8 +609,9 @@ class LazyBert(nn.Module, LazyModule):
             src_list.append(src[0])
         stacked_src, src_padding_mask = stack_sequential_tensor_with_mask(src_list)
 
-        # src_mask = torch.nn.Transformer.generate_square_subsequent_mask(None, list(stacked_src_batch_second.size())[0]).cuda()
-        out_batch_first = self.model(stacked_src)['last_hidden_state']
+        with timer.Pause():
+            out_batch_first = self.model(stacked_src)['last_hidden_state']
+
         self.done_buffer = [
             out_batch_first[idx, : len(src_list[idx])]
             for idx in range(len(self.later_buffer))

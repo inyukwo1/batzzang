@@ -1,7 +1,7 @@
 from typing import Callable, Type, Dict, Union, NewType, List, Any
 from abc import ABC
 from .lazy_modules import LazyModule
-
+from . import timer
 
 class State(ABC):
     pass
@@ -25,6 +25,7 @@ class Do:
         self.tensor_chains.append(tensorchain)
         return self
 
+    @timer.measure_time
     def bind(self, state_iter, list_prev_return):
         for tensor_chain in self.tensor_chains:
             list_prev_return = self._invoke_tensorchain(
@@ -36,10 +37,11 @@ class Do:
     def _invoke_tensorchain(
         self, callback: TensorChain, states: List[State], list_prev_return: List,
     ):
-        list_new_return = [
-            callback(state, tensor_dict)
-            for state, tensor_dict in zip(states, list_prev_return)
-        ]
+        with timer.Pause() :
+            list_new_return = [
+                callback(state, tensor_dict)
+                for state, tensor_dict in zip(states, list_prev_return)
+            ]
         LazyModule.wait_all()
         return list_new_return
 
@@ -56,6 +58,7 @@ class If:
         self.tensor_chains.append(tensorchain)
         return self
 
+    @timer.measure_time
     def bind(self, state_iter, list_prev_return):
         true_indices = [
             idx for idx, state in enumerate(state_iter) if self.state_checker(state)
@@ -83,10 +86,11 @@ class If:
     def _invoke_tensorchain(
         self, callback: TensorChain, states: List[State], list_prev_return: List,
     ):
-        list_new_return = [
-            callback(state, tensor_dict)
-            for state, tensor_dict in zip(states, list_prev_return)
-        ]
+        with timer.Pause():
+            list_new_return = [
+                callback(state, tensor_dict)
+                for state, tensor_dict in zip(states, list_prev_return)
+            ]
         LazyModule.wait_all()
         return list_new_return
 
@@ -104,6 +108,7 @@ class While:
         self.logic_units.append(logic_unit)
         return self
 
+    @timer.measure_time
     def bind(self, state_iter, prev_return):
         state_list = [state for state in state_iter]
 
@@ -122,6 +127,7 @@ class ForEachState:
         self.states = [state for state in state_iter]
         self.prev_return = [None] * len(self.states)
 
+    @timer.measure_time
     def apply(self, logic: Union[While, If]) -> "ForEachState":
         if isinstance(logic, While):
             self.prev_return = logic.bind(self.states, self.prev_return)

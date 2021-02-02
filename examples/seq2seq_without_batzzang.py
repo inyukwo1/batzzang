@@ -228,17 +228,22 @@ class TransformerSeq2Seq(nn.Module):
             loss += mask_loss
         return loss
 
-    def forward_teacher_forcing(self, src_variable, src_lengths, tgt_variable, tgt_padding_mask, max_tgt_length):
-        bsz = len(src_lengths)
-        src_padding_mask = (torch.arange(max(src_lengths))[None, :] > src_lengths[:, None]).cuda()
-        encoder_outputs = self.encode(src_variable, src_padding_mask)
+    def forward_teacher_forcing(self, input_variable, input_lengths, tgt_variable, tgt_padding_mask, max_tgt_length):
+        bsz = len(input_lengths)
+        src_padding_mask = (torch.arange(max(input_lengths))[None, :] > input_lengths[:, None]).cuda()
+        encoder_outputs = self.encode(input_variable, src_padding_mask)
 
         decoder_input = torch.cat((torch.LongTensor([SOS_token] * bsz).to(device).unsqueeze(0), tgt_variable[:-1]), dim=0)
         tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(None, list(tgt_variable.size())[0]).cuda()
         decoder_output = self.decode(decoder_input, encoder_outputs, tgt_mask, src_padding_mask, ~tgt_padding_mask.transpose(0,1))
         flatten_decoder_output = decoder_output.reshape(-1, decoder_output.shape[-1])
-        flatten_tgt_variable = tgt_variable.reshape(-1)
-        loss = self.loss(flatten_decoder_output, flatten_tgt_variable) * max_tgt_length
+
+        target_indices = (tgt_padding_mask.reshape(-1) != 0).nonzero()
+        target_decoder_output = flatten_decoder_output[target_indices].squeeze(1)
+        target_tgt_variable = tgt_variable.reshape(-1)[target_indices].squeeze(1)
+
+        avg_len = sum(input_lengths) / len(input_lengths)
+        loss = self.loss(target_decoder_output, target_tgt_variable) * avg_len
         return loss
 
 
@@ -291,17 +296,22 @@ class BertSeq2Seq(nn.Module):
             loss += mask_loss
         return loss
 
-    def forward_teacher_forcing(self, src_variable, src_lengths, tgt_variable, tgt_padding_mask, max_tgt_length):
-        bsz = len(src_lengths)
-        src_padding_mask = (torch.arange(max(src_lengths))[None, :] > src_lengths[:, None]).cuda()
-        encoder_outputs = self.encode(src_variable)
+    def forward_teacher_forcing(self, input_variable, input_lengths, tgt_variable, tgt_padding_mask, max_tgt_length):
+        bsz = len(input_lengths)
+        src_padding_mask = (torch.arange(max(input_lengths))[None, :] > input_lengths[:, None]).cuda()
+        encoder_outputs = self.encode(input_variable)
 
         decoder_input = torch.cat((torch.LongTensor([SOS_token] * bsz).to(device).unsqueeze(0), tgt_variable[:-1]), dim=0)
         tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(None, list(tgt_variable.size())[0]).cuda()
         decoder_output = self.decode(decoder_input, encoder_outputs, tgt_mask, src_padding_mask, ~tgt_padding_mask.transpose(0,1))
         flatten_decoder_output = decoder_output.reshape(-1, decoder_output.shape[-1])
-        flatten_tgt_variable = tgt_variable.reshape(-1)
-        loss = self.loss(flatten_decoder_output, flatten_tgt_variable) * max_tgt_length
+
+        target_indices = (tgt_padding_mask.reshape(-1) != 0).nonzero()
+        target_decoder_output = flatten_decoder_output[target_indices].squeeze(1)
+        target_tgt_variable = tgt_variable.reshape(-1)[target_indices].squeeze(1)
+
+        avg_len = sum(input_lengths) / len(input_lengths)
+        loss = self.loss(target_decoder_output, target_tgt_variable) * avg_len
         return loss
 
 
