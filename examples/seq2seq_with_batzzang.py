@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import random
 import argparse
 import time
-from batzzang.lazy_modules import LazyGRU, LazyEmbedding, LazyLinear, LazyAttention, LazyTransformerEncoder, LazyTransformerDecoder, LazyBert
+from batzzang.lazy_modules import LazyGRU, LazyEmbedding, LazyLinear, LazyAttention, LazyTransformerEncoder, LazyTransformerDecoder, LazyBert, LazySoftmaxArgmax
 from batzzang.monad import ForEachState, While, If, Do
 from load_and_trim_data import EOS_token, PAD_token, SOS_token, MAX_LENGTH, loadPrepareData, trimRareWords
 from create_formatted_data_file import create_formatted_data_file
@@ -31,7 +31,7 @@ def makeVar(l, voc, tokenizer=None):
     if tokenizer:
         indexes_batch = tokenizer(l, return_tensors='pt', padding=True).to("cuda")
     else:
-        indexes_batch = [torch.LongTensor(indexesFromSentence(voc, sentence)).to(device) for sentence in l]
+        indexes_batch = [torch.tensor(indexesFromSentence(voc, sentence), dtype=torch.long, device=device) for sentence in l]
     return indexes_batch
 
 
@@ -52,9 +52,14 @@ class State:
     def __init__(self, input_seq, target_seq):
         self.input_seq = input_seq
         self.target_seq = target_seq
-        self.decoder_input_token = torch.LongTensor([SOS_token]).to(device)
+        self.decoder_input_token = torch.tensor([SOS_token], dtype=torch.long, device=device)
         self.decoding_cnt = 0
         self.loss = 0
+
+    @classmethod
+    def create_states(cls, input_seq_batch, target_seq_batch):
+        assert len(input_seq_batch) == len(target_seq_batch)
+        return [cls(input_seq, target_seq) for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)]
 
 class StateBert(State):
     def __init__(self, input_seq, target_seq):
@@ -62,20 +67,16 @@ class StateBert(State):
         self.input_length = (input_seq['attention_mask'] != 0).sum().item()
 
 
-class StateTeacherForcing:
+class StateTeacherForcing(State):
     def __init__(self, input_seq, target_seq):
-        self.input_seq = input_seq
-        self.target_seq = target_seq
-        self.decoder_input = torch.cat((torch.LongTensor([SOS_token]).to(device), target_seq[:-1]), dim=0)
-
-        self.loss = 0
+        super(StateTeacherForcing, self).__init__(input_seq, target_seq)
+        self.decoder_input = torch.cat((torch.tensor([SOS_token], dtype=torch.long, device=device), target_seq[:-1]), dim=0)
 
 
 class StateTeacherForcingBert(StateTeacherForcing):
     def __init__(self, input_seq, target_seq):
         super(StateTeacherForcingBert, self).__init__(input_seq['input_ids'], target_seq)
         self.input_length = (input_seq['attention_mask'] != 0).sum().item()
-
 
 
 class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
@@ -93,19 +94,14 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
         self.loss = nn.CrossEntropyLoss()
 
     def forward_no_teacher_forcing(self, input_seq_batch, target_seq_batch):
-        states = [
-            State(input_seq, target_seq)
-            for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)
-        ]
-
-        def embed(state: State, _):
+        def embed_encoder_input(state: State, _):
             return self.embedding.forward_later(state.input_seq)
 
-        def encode(state: State, previous_output):
+        def forward_encoder(state: State, previous_output):
             embedded_tensor = previous_output.result
             return self.encoder_gru.forward_later(embedded_tensor)
 
-        def is_not_done(state: State):
+        def is_not_complete_output_seq(state: State):
             return state.decoding_cnt < len(state.target_seq)
 
         def embed_decoder_input(state: State, previous_output):
@@ -122,17 +118,17 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
             decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
             return encoder_output, decoder_hidden, decoder_input_embedded_promise
 
-        def decode_gru(state: State, previous_output):
+        def forward_decoder(state: State, previous_output):
             encoder_output, decoder_hidden, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return encoder_output, self.decoder_gru.forward_later(decoder_input_embedded, decoder_hidden)
+            return encoder_output, self.decoder_gru.forward_later(decoder_input_embedded)
 
-        def attention(state: State, previous_output):
+        def compute_attention(state: State, previous_output):
             encoder_output, decoder_hidden_promise = previous_output
             decoder_output, decoder_hidden = decoder_hidden_promise.result
             return encoder_output, decoder_hidden, self.att.forward_later(decoder_output, encoder_output)
 
-        def out(state: State, previous_output):
+        def compute_output_prob(state: State, previous_output):
             encoder_output, decoder_hidden, attention_promise = previous_output
             attention_output, _ = attention_promise.result
             output_promise = self.out.forward_later(attention_output)
@@ -140,6 +136,7 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
 
         def calc_loss(state: State, previous_output):
             encoder_output, decoder_hidden, output_promise = previous_output
+
             output = F.softmax(output_promise.result.squeeze(0), dim=-1)
             target_idx = state.target_seq[state.decoding_cnt]
             state.loss += -torch.log(output[target_idx])
@@ -148,32 +145,27 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
             state.decoder_input_token = torch.argmax(output).unsqueeze(0)
             return encoder_output, decoder_hidden
 
+        states = State.create_states(input_seq_batch, target_seq_batch)
         result_states = ForEachState(states).apply(
-            Do(embed)
-                .Then(encode)
+            Do(embed_encoder_input)
+                .Then(forward_encoder)
         ).apply(
-            While.Any(is_not_done,
-                If(is_not_done)
-                    .Then(embed_decoder_input)
-                    .Then(decode_gru)
-                    .Then(attention)
-                    .Then(out)
-                    .Then(calc_loss)
+            While(is_not_complete_output_seq,
+                Do(embed_decoder_input)
+                .Then(forward_decoder)
+                .Then(compute_attention)
+                .Then(compute_output_prob)
+                .Then(calc_loss)
             )
         ).states
 
         return sum([state.loss / state.decoding_cnt for state in result_states])
 
     def forward_teacher_forcing(self, input_seq_batch, target_seq_batch):
-        states = [
-            StateTeacherForcing(input_seq, target_seq)
-            for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)
-        ]
-
-        def embed(state: StateTeacherForcing, _):
+        def embed_encoder_input(state: StateTeacherForcing, _):
             return self.embedding.forward_later(state.input_seq)
 
-        def encode(state: StateTeacherForcing, previous_output):
+        def forward_encoder(state: StateTeacherForcing, previous_output):
             embedded_tensor = previous_output.result
             return self.encoder_gru.forward_later(embedded_tensor)
 
@@ -188,17 +180,17 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
             decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
             return encoder_output, decoder_hidden, decoder_input_embedded_promise
 
-        def decode_gru(state: StateTeacherForcing, previous_output):
+        def forward_decoder(state: StateTeacherForcing, previous_output):
             encoder_output, decoder_hidden, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return encoder_output, self.decoder_gru.forward_later(decoder_input_embedded, decoder_hidden)
+            return encoder_output, self.decoder_gru.forward_later(decoder_input_embedded)
 
-        def attention(state: StateTeacherForcing, previous_output):
+        def compute_attention(state: StateTeacherForcing, previous_output):
             encoder_output, decoder_hidden_promise = previous_output
             decoder_output, decoder_hidden = decoder_hidden_promise.result
             return self.att.forward_later(decoder_output, encoder_output)
 
-        def out(state: StateTeacherForcing, previous_output):
+        def compute_output_prob(state: StateTeacherForcing, previous_output):
             attention_promise = previous_output
             attention_output, _ = attention_promise.result
             output_promise = self.out.forward_later(attention_output)
@@ -209,16 +201,17 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
             state.loss = self.loss(output_promise.result, state.target_seq)
             return None
 
+        states = StateTeacherForcing.create_states(input_seq_batch, target_seq_batch)
+
         result_states = ForEachState(states).apply(
-            Do(embed)
-                .Then(encode)
+            Do(embed_encoder_input)
+                .Then(forward_encoder)
                 .Then(embed_decoder_input)
-                .Then(decode_gru)
-                .Then(attention)
-                .Then(out)
+                .Then(forward_decoder)
+                .Then(compute_attention)
+                .Then(compute_output_prob)
                 .Then(calc_loss)
         ).states
-
 
         return sum([state.loss for state in result_states])
 
@@ -227,27 +220,23 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
     def __init__(self, vocab_num, hidden_size, layer_num, dropout):
         super(TransformerSeq2SeqWithBatzzang, self).__init__()
         self.embedding = LazyEmbedding(vocab_num, hidden_size, dropout)
-        self.encoder_transformer = LazyTransformerEncoder(hidden_size, nhead=8, dim_feedforward=1024, layer_num=4)
-        self.decoder_transformer = LazyTransformerDecoder(hidden_size, nhead=8, dim_feedforward=1024, layer_num=4)
+        self.encoder_transformer = LazyTransformerEncoder(hidden_size, nhead=8, dim_feedforward=1024, layer_num=layer_num)
+        self.decoder_transformer = LazyTransformerDecoder(hidden_size, nhead=8, dim_feedforward=1024, layer_num=layer_num)
         self.layer_num = layer_num
         self.out = LazyLinear(hidden_size, vocab_num)
+        self.softmax_argmax = LazySoftmaxArgmax()
         self.hidden_size = hidden_size
         self.loss = nn.CrossEntropyLoss()
 
     def forward_no_teacher_forcing(self, input_seq_batch, target_seq_batch):
-        states = [
-            State(input_seq, target_seq)
-            for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)
-        ]
+        def embed_encoder_input(state: State, _):
+            return self.embedding(state.input_seq)
 
-        def embed(state: State, _):
-            return self.embedding.forward_later(state.input_seq)
-
-        def encode(state: State, previous_output):
+        def forward_encoder(state: State, previous_output):
             embedded_tensor = previous_output.result
             return self.encoder_transformer.forward_later(embedded_tensor)
 
-        def is_not_done(state: State):
+        def is_not_complete_output_seq(state: State):
             return state.decoding_cnt < len(state.target_seq)
 
         def embed_decoder_input(state: State, previous_output):
@@ -262,12 +251,12 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
             decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
-        def decode_transformer(state: State, previous_output):
+        def forward_decoder(state: State, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
             return encoder_output, self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
 
-        def out(state: State, previous_output):
+        def compute_output_prob(state: State, previous_output):
             encoder_output, decoder_output_promise = previous_output
             decoder_output = decoder_output_promise.result
             output_promise = self.out.forward_later(decoder_output)
@@ -275,39 +264,40 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
 
         def calc_loss(state: State, previous_output):
             encoder_output, output_promise, = previous_output
-            output = F.softmax(output_promise.result.squeeze(0), dim=-1)
             target_idx = state.target_seq[state.decoding_cnt]
-            state.loss += - torch.log(output[target_idx])
+            loss_and_next_token_promise = self.softmax_argmax.forward_later(output_promise.result.squeeze(0), target_idx)
+            return encoder_output, loss_and_next_token_promise
 
+        def update_state(state: State, previous_output):
+            encoder_output, output_promise = previous_output
+            loss, next_token = output_promise.result
+            state.loss += loss
+            state.decoder_input_token = next_token.unsqueeze(0)
             state.decoding_cnt += 1
-            state.decoder_input_token = torch.argmax(output).unsqueeze(0)
             return encoder_output
 
+        states = State.create_states(input_seq_batch, target_seq_batch)
+
         result_states = ForEachState(states).apply(
-            Do(embed)
-            .Then(encode)
+            Do(embed_encoder_input)
+            .Then(forward_encoder)
         ).apply(
-            While.Any(is_not_done,
-                    If(is_not_done)
-                      .Then(embed_decoder_input)
-                      .Then(decode_transformer)
-                      .Then(out)
-                      .Then(calc_loss)
+            While(is_not_complete_output_seq,
+                Do(embed_decoder_input)
+                .Then(forward_decoder)
+                .Then(compute_output_prob)
+                .Then(calc_loss)
+                .Then(update_state)
             )
         ).states
 
         return sum([state.loss / state.decoding_cnt for state in result_states])
 
     def forward_teacher_forcing(self, input_seq_batch, target_seq_batch):
-        states = [
-            StateTeacherForcing(input_seq, target_seq)
-            for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)
-        ]
-
-        def embed(state:StateTeacherForcing, _):
+        def embed_encoder_input(state:StateTeacherForcing, _):
             return self.embedding.forward_later(state.input_seq)
 
-        def encode(state: StateTeacherForcing, previous_output):
+        def forward_encoder(state: StateTeacherForcing, previous_output):
             embedded_tensor = previous_output.result
             return self.encoder_transformer.forward_later(embedded_tensor)
 
@@ -318,12 +308,12 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
             decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
-        def decode_transformer(state: StateTeacherForcing, previous_output):
+        def forward_decoder(state: StateTeacherForcing, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
             return self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
 
-        def out(state: StateTeacherForcing, previous_output):
+        def compute_output_prob(state: StateTeacherForcing, previous_output):
             decoder_promise = previous_output
             decoder_output = decoder_promise.result
             output_promise = self.out.forward_later(decoder_output)
@@ -334,12 +324,14 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
             state.loss = self.loss(output_promise.result, state.target_seq)
             return None
 
+        states = StateTeacherForcing.create_states(input_seq_batch, target_seq_batch)
+
         result_states = ForEachState(states).apply(
-            Do(embed)
-            .Then(encode)
+            Do(embed_encoder_input)
+            .Then(forward_encoder)
             .Then(embed_decoder_input)
-            .Then(decode_transformer)
-            .Then(out)
+            .Then(forward_decoder)
+            .Then(compute_output_prob)
             .Then(calc_loss)
         ).states
 
@@ -347,9 +339,8 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
 
 
 class BertSeq2SeqWithBatzzang(nn.Module):
-    def __init__(self, vocab_num, _, layer_num, dropout):
+    def __init__(self, vocab_num, hidden_size, layer_num, dropout):
         super(BertSeq2SeqWithBatzzang, self).__init__()
-        hidden_size = 768
         self.embedding = LazyEmbedding(vocab_num, hidden_size, dropout)
         self.encoder = LazyBert()
         self.decoder_transformer = LazyTransformerDecoder(hidden_size, 2, 1024, 2)
@@ -359,19 +350,10 @@ class BertSeq2SeqWithBatzzang(nn.Module):
         self.loss = nn.CrossEntropyLoss()
 
     def forward_no_teacher_forcing(self, input_seq_batch, target_seq_batch):
-        input_seq_batch = [{"input_ids": input_seq_batch.data['input_ids'][idx],
-                            "attention_mask": input_seq_batch.data['attention_mask'][idx]}
-                           for idx in range(input_seq_batch.data['attention_mask'].size(0))]
-
-        states = [
-            StateBert(input_seq, target_seq)
-            for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)
-        ]
-
-        def encode(state: StateBert, _):
+        def forward_encoder(state: StateBert, _):
             return self.encoder.forward_later(state.input_seq)
 
-        def is_not_done(state: StateBert):
+        def is_not_complete_output_seq(state: StateBert):
             return state.decoding_cnt < len(state.target_seq)
 
         def embed_decoder_input(state: StateBert, previous_output):
@@ -386,12 +368,12 @@ class BertSeq2SeqWithBatzzang(nn.Module):
             decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
-        def decode_transformer(state: StateBert, previous_output):
+        def forward_decoder(state: StateBert, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
             return encoder_output, self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
 
-        def out(state: StateBert, previous_output):
+        def compute_output_prob(state: StateBert, previous_output):
             encoder_output, decoder_output_promise = previous_output
             decoder_output = decoder_output_promise.result
             output_promise = self.out.forward_later(decoder_output)
@@ -407,14 +389,19 @@ class BertSeq2SeqWithBatzzang(nn.Module):
             state.decoder_input_token = torch.argmax(output).unsqueeze(0)
             return encoder_output
 
+        input_seq_batch = [{"input_ids": input_seq_batch.data['input_ids'][idx],
+                            "attention_mask": input_seq_batch.data['attention_mask'][idx]}
+                           for idx in range(input_seq_batch.data['attention_mask'].size(0))]
+
+        states = StateBert.create_states(input_seq_batch, target_seq_batch)
+
         result_states = ForEachState(states).apply(
-            Do(encode)
+            Do(forward_encoder)
         ).apply(
-            While.Any(is_not_done,
-                    If(is_not_done)
-                      .Then(embed_decoder_input)
-                      .Then(decode_transformer)
-                      .Then(out)
+            While(is_not_complete_output_seq,
+                      Do(embed_decoder_input)
+                      .Then(forward_decoder)
+                      .Then(compute_output_prob)
                       .Then(calc_loss)
             )
         ).states
@@ -422,15 +409,7 @@ class BertSeq2SeqWithBatzzang(nn.Module):
         return sum([state.loss / state.decoding_cnt for state in result_states])
 
     def forward_teacher_forcing(self, input_seq_batch, target_seq_batch):
-        input_seq_batch = [{"input_ids": input_seq_batch.data['input_ids'][idx],
-                            "attention_mask": input_seq_batch.data['attention_mask'][idx]}
-                           for idx in range(input_seq_batch.data['attention_mask'].size(0))]
-        states = [
-            StateTeacherForcingBert(input_seq, target_seq)
-            for input_seq, target_seq in zip(input_seq_batch, target_seq_batch)
-        ]
-
-        def encode(state: StateTeacherForcingBert, _):
+        def forward_encoder(state: StateTeacherForcingBert, _):
             return self.encoder.forward_later(state.input_seq)
 
         def embed_decoder_input(state: StateTeacherForcingBert, previous_output):
@@ -440,12 +419,12 @@ class BertSeq2SeqWithBatzzang(nn.Module):
             decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
-        def decode_transformer(state: StateTeacherForcingBert, previous_output):
+        def forward_decoder(state: StateTeacherForcingBert, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
             return self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
 
-        def out(state: StateTeacherForcingBert, previous_output):
+        def compute_output_prob(state: StateTeacherForcingBert, previous_output):
             decoder_promise = previous_output
             decoder_output = decoder_promise.result
             output_promise = self.out.forward_later(decoder_output)
@@ -456,11 +435,17 @@ class BertSeq2SeqWithBatzzang(nn.Module):
             state.loss = self.loss(output_promise.result, state.target_seq)
             return None
 
+        input_seq_batch = [{"input_ids": input_seq_batch.data['input_ids'][idx],
+                            "attention_mask": input_seq_batch.data['attention_mask'][idx]}
+                           for idx in range(input_seq_batch.data['attention_mask'].size(0))]
+
+        states = StateTeacherForcingBert.create_states(input_seq_batch, target_seq_batch)
+
         result_states = ForEachState(states).apply(
-            Do(encode)
+            Do(forward_encoder)
             .Then(embed_decoder_input)
-            .Then(decode_transformer)
-            .Then(out)
+            .Then(forward_decoder)
+            .Then(compute_output_prob)
             .Then(calc_loss)
         ).states
 
@@ -478,7 +463,9 @@ def train(input_seq_batch, target_seq_batch, model, optimizer, clip, no_teacher_
         loss = model.forward_teacher_forcing(input_seq_batch, target_seq_batch)
 
     # Perform backpropatation
+    t1 = time.time()
     loss.backward()
+    print(f"Backward time:{time.time() - t1}")
 
     # Clip gradients: gradients are modified in place
     _ = nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -532,7 +519,7 @@ def main():
     voc, pairs = loadPrepareData()
 
     # Configurations
-    hidden_size = 512
+    hidden_size = 768 if args.model == 'bert' else 512
     layer_num = 2
     dropout = 0.1
     batch_size = 64
@@ -566,7 +553,7 @@ def main():
                 state[k] = v.cuda()
 
     # Run training iterations
-    print("Starting Training!")
+    print("Start Training!")
     trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, args.no_teacher_forcing)
     timer.Timer.show_elapsed_time()
 

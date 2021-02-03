@@ -12,6 +12,11 @@ class Timer:
         assert Timer.stop_time is None
         print(f"Elapsed time: {Timer.elapsed_time}")
 
+    def __del__(self):
+        if Timer.elapsed_time != 0.0:
+            Timer.show_elapsed_time()
+
+
 class Pause:
     def __enter__(self):
         if Timer.start_time is not None:

@@ -26,13 +26,14 @@ class Do:
         return self
 
     @timer.measure_time
-    def bind(self, state_iter, list_prev_return):
+    def bind(self, state_iter, prev_return_iter):
+        state_list, prev_return_list = list(state_iter), list(prev_return_iter)
         for tensor_chain in self.tensor_chains:
-            list_prev_return = self._invoke_tensorchain(
-                tensor_chain, list(state_iter), list_prev_return
+            prev_return_list = self._invoke_tensorchain(
+                tensor_chain, state_list, prev_return_list
             )
 
-        return list_prev_return
+        return prev_return_list
 
     def _invoke_tensorchain(
         self, callback: TensorChain, states: List[State], list_prev_return: List,
@@ -96,12 +97,8 @@ class If:
 
 
 class While:
-    @classmethod
-    def Any(cls, stop_if_all_false: StateChecker, logic_unit: Union[Do, If]) -> "While":
-        return While(stop_if_all_false, logic_unit)
-
-    def __init__(self, stop_if_all_false: StateChecker, logic_unit: Union[Do, If]):
-        self.stop_if_all_false = stop_if_all_false
+    def __init__(self, state_checker: StateChecker, logic_unit: Union[Do, If]):
+        self.condition_checker = state_checker
         self.logic_units = [logic_unit]
 
     def __call__(self, logic_unit: If):
@@ -109,17 +106,27 @@ class While:
         return self
 
     @timer.measure_time
-    def bind(self, state_iter, prev_return):
-        state_list = [state for state in state_iter]
+    def bind(self, state_iter, return_iter):
+        state_list, return_list = list(state_iter), list(return_iter)
+        assert len(state_list) == len(return_list)
+        active_state_indices = range(len(state_list))
 
-        def is_not_done():
-            check_results = [self.stop_if_all_false(state) for state in state_list]
-            return any(check_results)
+        while active_state_indices:
+            # Get prev return values for active states
+            active_return = map(lambda i: return_list[i], active_state_indices)
+            active_states = map(lambda i: state_list[i], active_state_indices)
 
-        while is_not_done():
+            # perform logics
             for idx, logic_unit in enumerate(self.logic_units):
-                prev_return = logic_unit.bind(state_list, prev_return)
-        return prev_return
+                active_return = logic_unit.bind(active_states, active_return)
+
+            # save new return values
+            for l_idx, g_idx in enumerate(active_state_indices):
+                return_list[g_idx] = active_return[l_idx]
+
+            # Re-check active states
+            active_state_indices = list(filter(lambda i: self.condition_checker(state_list[i]), active_state_indices))
+        return return_iter
 
 
 class ForEachState:
@@ -129,9 +136,6 @@ class ForEachState:
 
     @timer.measure_time
     def apply(self, logic: Union[While, If]) -> "ForEachState":
-        if isinstance(logic, While):
-            self.prev_return = logic.bind(self.states, self.prev_return)
-        else:
-            self.prev_return = logic.bind(self.states, self.prev_return)
+        self.prev_return = logic.bind(self.states, self.prev_return)
         return self
 
