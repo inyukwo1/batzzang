@@ -47,7 +47,7 @@ class LazyModule(ABC):
 
 
 class LazyEmbedding(nn.Module, LazyModule):
-    def __init__(self, num_words, hidden_size, dropout):
+    def __init__(self, num_words, hidden_size, dropout=0.):
         super(LazyEmbedding, self).__init__()
         LazyModule.__init__(self)
         self.module = nn.Embedding(num_words, hidden_size)
