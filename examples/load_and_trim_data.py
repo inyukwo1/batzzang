@@ -96,11 +96,19 @@ def normalizeString(s):
 
 
 # Read query/response pairs and return a voc object
-def readVocs(datafile, corpus_name):
+def readVocs(datafile, corpus_name, toy=True):
     print("Reading lines...")
     # Read the file and split into lines
-    lines = open(datafile, encoding='utf-8').\
-        read().strip().split('\n')
+    lines = []
+    with open(datafile, 'r', encoding="utf-8") as f:
+        cnt = 0
+        for line in f:
+            lines += [line.strip()]
+            cnt += 1
+            if toy and cnt >= 512:
+                break
+    # lines = open(datafile, encoding='utf-8').\
+    #     read().strip().split('\n')
     # Split every line into pairs and normalize
     pairs = [[normalizeString(s) for s in l.split('\t')] for l in lines]
     voc = Voc(corpus_name)
