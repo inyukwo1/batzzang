@@ -3,13 +3,13 @@ import time
 
 class Timer:
     start_time = None
-    stop_time = None
+    pause_time = None
     elapsed_time = 0.0
 
     @classmethod
     def show_elapsed_time(cls):
         assert Timer.start_time is None
-        assert Timer.stop_time is None
+        assert Timer.pause_time is None
         print(f"Elapsed time: {Timer.elapsed_time}")
 
     def __del__(self):
@@ -20,12 +20,12 @@ class Timer:
 class Pause:
     def __enter__(self):
         if Timer.start_time is not None:
-            Timer.stop_time = time.time()
+            Timer.pause_time = time.time()
 
     def __exit__(self, type, value, traceback):
         if Timer.start_time is not None:
-            Timer.start_time += (time.time() - Timer.stop_time)
-            Timer.stop_time = None
+            Timer.start_time += (time.time() - Timer.pause_time)
+            Timer.pause_time = None
 
 
 def measure_time(func):
