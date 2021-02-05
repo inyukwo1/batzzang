@@ -299,10 +299,15 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
             return self.embedding(state.input_seq)
 
         def forward_encoder(state: StateTeacherForcing, previous_output):
+            return self.out(previous_output.result)
+
             embedded_tensor = previous_output.result
             return self.encoder_transformer(embedded_tensor)
 
         def embed_decoder_input(state: StateTeacherForcing, previous_output):
+            state.loss = previous_output.result.sum()
+            return None
+
             encoder_promise = previous_output
             encoder_output = encoder_promise.result
             decoder_input = state.decoder_input
@@ -331,9 +336,9 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
             Do(embed_encoder_input)
             .Then(forward_encoder)
             .Then(embed_decoder_input)
-            .Then(forward_decoder)
-            .Then(compute_output_prob)
-            .Then(calc_loss)
+            # .Then(forward_decoder)
+            # .Then(compute_output_prob)
+            # .Then(calc_loss)
         ).states
 
         return sum([state.loss for state in result_states])

@@ -15,65 +15,50 @@ from .tensor_promise import TensorPromise
 from .utils import assert_dim, stack_sequential_tensor_with_mask
 from . import timer
 
-class LazyModule(nn.Module):
-    waiting_lazy_modules: List["LazyModule"] = []
+class LazyModuleTracker:
+    waiting_list: List["LazyModule"] = []
 
+    @classmethod
+    def wait_all(cls):
+        while LazyModuleTracker.waiting_list:
+            lazy_module = LazyModuleTracker.waiting_list.pop(0)
+            zipped_input = list(itertools.zip_longest(*lazy_module.input_buffer))
+            return_values = lazy_module.forward(*zipped_input)
+            assert len(lazy_module.input_buffer) == len(return_values)
+            for idx in range(len(lazy_module.input_buffer)):
+                lazy_module.promises[idx].result = return_values[idx]
+            lazy_module.input_buffer = []
+            lazy_module.promises = []
+
+
+class LazyModule(torch.jit.ScriptModule):
     def __init__(self):
         super(LazyModule, self).__init__()
-        self.later_buffer = []
         self.promises = []
-        self.done_buffer = []
+        self.input_buffer = []
 
     def __call__(self, *args, **kwargs):
         return self.forward_later(*args, **kwargs)
 
-    @property
-    def promise_length(self):
-        return len(self.promises)
-
-    @property
-    def done_length(self):
-        return len(self.done_buffer)
-
-    @classmethod
-    def wait_all(cls):
-        for lazy_module in LazyModule.waiting_lazy_modules:
-            zipped_input = list(itertools.zip_longest(*lazy_module.later_buffer))
-            lazy_module.done_buffer = lazy_module.compute(*zipped_input)
-            assert len(lazy_module.promises) == len(lazy_module.done_buffer), \
-                f"Expected to return {lazy_module.promise_length} values " \
-                f"but {lazy_module.done_length} values returned " \
-                f"at {type(lazy_module).__name__}.compute"
-
-            for idx in range(len(lazy_module.later_buffer)):
-                lazy_module.promises[idx].result = lazy_module.done_buffer[idx]
-            lazy_module.later_buffer = []
-            lazy_module.promises = []
-            lazy_module.done_buffer = []
-        LazyModule.waiting_lazy_modules = []
-
     def forward_later(self, *inputs) -> TensorPromise:
-        if self not in LazyModule.waiting_lazy_modules:
-            LazyModule.waiting_lazy_modules.append(self)
+        if self not in LazyModuleTracker.waiting_list:
+            LazyModuleTracker.waiting_list.append(self)
         self.assert_input(*inputs)
-        self.later_buffer.append(inputs)
-        appended_index = len(self.later_buffer) - 1
+        self.input_buffer.append(inputs)
+        appended_index = len(self.input_buffer) - 1
         promise = TensorPromise(self, appended_index)
         self.promises.append(promise)
         return promise
 
-    @abstractmethod
-    def assert_input(self, *inputs):
-        pass
+    # def assert_input(self, args):
+    #     pass
 
-    @abstractmethod
-    def compute(self, *args) -> None:
-        """
-        :param args: For each argument, argument values are collated from individual states and zipped as a single batch
-        :return: list of values that are unzipped which will be propagated into individual states
-        """
-        pass
-
+    # def forward(self, args):
+    #     """
+    #     :param args: For each argument, argument values are collated from individual states and zipped as a single batch
+    #     :return: list of values that are unzipped which will be propagated into individual states
+    #     """
+    #     pass
 
 class LazyEmbedding(LazyModule):
     def __init__(self, num_words, hidden_size, dropout):
@@ -83,10 +68,11 @@ class LazyEmbedding(LazyModule):
         self.num_words = num_words
         self.hidden_size = hidden_size
 
-    def assert_input(self, *inputs):
+    def assert_input(self, inputs: List[torch.Tensor]):
         pass
 
-    def compute(self, input_seq_list):
+    @torch.jit.script_method
+    def forward(self, input_seq_list: List[torch.Tensor]):
         if len(input_seq_list[0].size()) == 1:
             tensor_length = [len(item) for item in input_seq_list]
             stacked_tensors = torch.zeros(
@@ -95,8 +81,9 @@ class LazyEmbedding(LazyModule):
             for idx, _tensor in enumerate(input_seq_list):
                 stacked_tensors[idx][: len(_tensor)] = _tensor
 
-            with timer.Pause():
-                computed_tensors = self.dropout(self.module(stacked_tensors))
+            # with timer.Pause():
+            #     computed_tensors = self.dropout(self.module(stacked_tensors))
+            computed_tensors = self.dropout(self.module(stacked_tensors))
 
             # Split
             result = [
@@ -111,8 +98,9 @@ class LazyEmbedding(LazyModule):
             for idx, _tensor in enumerate(input_seq_list):
                 stacked_tensors[idx] = _tensor
 
-            with timer.Pause():
-                computed_tensors = self.dropout(self.module(stacked_tensors))
+            # with timer.Pause():
+            #     computed_tensors = self.dropout(self.module(stacked_tensors))
+            computed_tensors = self.dropout(self.module(stacked_tensors))
 
             # Split
             result = list(torch.unbind(computed_tensors))
@@ -123,21 +111,23 @@ class LazyEmbedding(LazyModule):
 
 
 class LazyLinear(LazyModule):
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim: int, out_dim: int):
         super(LazyLinear, self).__init__()
         self.module = nn.Linear(in_dim, out_dim)
         self.in_dim = in_dim
         self.out_dim = out_dim
 
-    def assert_input(self, *inputs):
-        [tensor] = inputs
-        assert isinstance(tensor, torch.Tensor)
-        if len(tensor.size()) == 1:
-            assert_dim([self.in_dim], tensor)
-        elif len(tensor.size()) == 2:
-            assert_dim([None, self.in_dim], tensor)
+    def assert_input(self, inputs: List[torch.Tensor]):
+        pass
+        # [tensor] = inputs
+        # assert isinstance(tensor, torch.Tensor)
+        # if len(tensor.size()) == 1:
+        #     assert_dim([self.in_dim], tensor)
+        # elif len(tensor.size()) == 2:
+        #     assert_dim([None, self.in_dim], tensor)
 
-    def compute(self, tensor_list):
+    @torch.jit.script_method
+    def forward(self, tensor_list: List[torch.Tensor]):
         if len(tensor_list[0].size()) == 2:
             tensor_length = [len(item) for item in tensor_list]
             stacked_tensors = torch.zeros(
@@ -146,11 +136,12 @@ class LazyLinear(LazyModule):
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx][: len(_tensor)] = _tensor
 
-            with timer.Pause():
-                computed_tensors = self.module(stacked_tensors)
+            # with timer.Pause():
+            #     computed_tensors = self.module(stacked_tensors)
+            computed_tensors = self.module(stacked_tensors)
 
             # Split
-            result = [
+            result: List[torch.Tensor] = [
                 computed_tensor[:length]
                 for length, computed_tensor in zip(tensor_length, computed_tensors)
             ]
@@ -161,8 +152,9 @@ class LazyLinear(LazyModule):
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx] = _tensor
 
-            with timer.Pause():
-                computed_tensors = self.module(stacked_tensors)
+            # with timer.Pause():
+            #     computed_tensors = self.module(stacked_tensors)
+            computed_tensors = self.module(stacked_tensors)
 
             # Split
             result = list(torch.unbind(computed_tensors))
@@ -181,7 +173,7 @@ class LazyLSTMCell(LazyModule):
     def assert_input(self, *inputs):
         pass
 
-    def compute(self, input_list, lstm_state_list):
+    def forward(self, input_list, lstm_state_list):
         hidden_list = []
         cell_list = []
         for hidden, cell in self.lstm_state_list:
@@ -212,7 +204,7 @@ class LazyLSTM(LazyModule):
     def assert_intput(self, *inputs):
         pass
 
-    def compute(self, input_list):
+    def forward(self, input_list):
         # Stack
         stacked_input, input_mask = stack_sequential_tensor_with_mask(input_list)
 
@@ -267,7 +259,7 @@ class LazyGRUCell(LazyModule):
     def assert_intput(self, *inputs):
         pass
 
-    def compute(self, input_list, hidden_list):
+    def forward(self, input_list, hidden_list):
         # Stacked
         stacked_input = torch.stack(input_list)
         stacked_hidden = torch.stack(hidden_list)
@@ -291,7 +283,7 @@ class LazyGRU(LazyModule):
     def assert_intput(self, *inputs):
         pass
 
-    def compute(self, input_list):
+    def forward(self, input_list):
         # Stack
         stacked_input, input_mask = stack_sequential_tensor_with_mask(input_list)
 
@@ -334,9 +326,9 @@ class LazyGRU(LazyModule):
 class LazyTransformerEncoder(LazyModule):
     def __init__(self, d_model, nhead, dim_feedforward, layer_num, dropout=0.1, activation='relu'):
         super(LazyTransformerEncoder, self).__init__()
-        decoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
                                                    dropout=dropout, activation=activation)
-        self.module = nn.TransformerEncoder(decoder_layer, num_layers=layer_num)
+        self.module = nn.TransformerEncoder(encoder_layer, num_layers=layer_num)
         self.in_dim = d_model
         self._init_positional_embedding(dropout)
 
@@ -357,24 +349,33 @@ class LazyTransformerEncoder(LazyModule):
         x = x + self.pe[: x.size(0), :]
         return self.pos_dropout(x)
 
-    def assert_input(self, *inputs):
-        src = inputs[0]
-        assert_dim([None, self.in_dim], src)
+    def assert_input(self, src):
+        return None
+        # assert_dim([None, self.in_dim], src)
 
-    def compute(self, src_list):
+    @torch.jit.script_method
+    def forward(self, src_list: List[torch.Tensor]):
         bsz = len(src_list)
         stacked_src, src_padding_mask = stack_sequential_tensor_with_mask(src_list)
         stacked_src_batch_second = stacked_src.transpose(0, 1)
 
-        with timer.Pause():
-            pos_encoded_src_batch_second = self._pos_encode(stacked_src_batch_second)
+        # with timer.Pause():
+        #     pos_encoded_src_batch_second = self._pos_encode(stacked_src_batch_second)
+        #
+        #     out_batch_first = self.module(
+        #         pos_encoded_src_batch_second,
+        #         src_key_padding_mask=src_padding_mask,
+        #     ).transpose(0, 1)
 
-            out_batch_first = self.module(
-                pos_encoded_src_batch_second,
-                src_key_padding_mask=src_padding_mask,
-            ).transpose(0, 1)
+        pos_encoded_src_batch_second = self._pos_encode(stacked_src_batch_second)
 
-        return list(map(lambda i: out_batch_first[i, :len(src_list[i])], range(bsz)))
+        out_batch_first = self.module(
+            pos_encoded_src_batch_second,
+            src_key_padding_mask=src_padding_mask,
+        ).transpose(0, 1)
+
+        return [out_batch_first[i, :len(src_list[i])] for i in range(bsz)]
+        # return list(map(lambda i: out_batch_first[i, :len(src_list[i])], range(bsz)))
 
 
 class LazyTransformerDecoder(LazyModule):
@@ -409,7 +410,7 @@ class LazyTransformerDecoder(LazyModule):
         assert_dim([None, self.in_dim], tgt)
         assert_dim([None, self.in_dim], mem)
 
-    def compute(self, tgt_list, mem_list):
+    def forward(self, tgt_list, mem_list):
         bsz = len(tgt_list)
         stacked_tgt, tgt_padding_mask = stack_sequential_tensor_with_mask(tgt_list)
         stacked_mem, mem_padding_mask = stack_sequential_tensor_with_mask(mem_list)
@@ -448,7 +449,7 @@ class LazyAttention(LazyModule):
     def assert_input(self, *inputs):
         pass
 
-    def compute(self, query_list, context_list):
+    def forward(self, query_list, context_list):
         query, q_mask = stack_sequential_tensor_with_mask(query_list)
         context, c_mask = stack_sequential_tensor_with_mask(context_list)
 
@@ -504,7 +505,7 @@ class LazyPointerNet(LazyModule):
     def assert_input(self, *inputs):
         pass
 
-    def compute(self, query_list, key_list):
+    def forward(self, query_list, key_list):
         stacked_query, query_mask = stack_sequential_tensor_with_mask(query_list)
         stacked_key = torch.stack(key_list)
 
@@ -530,7 +531,7 @@ class LazyMemoryPointerNet(LazyModule):
     def assert_input(self, *inputs):
         pass
 
-    def compute(self, encoded_col_list, att_vec_list, col_memory_mask):
+    def forward(self, encoded_col_list, att_vec_list, col_memory_mask):
         stacked_col, col_mask = stack_sequential_tensor_with_mask(encoded_col_list)
         stacked_att = torch.stack(att_vec_list)
         stacked_mem_mask, _ = stack_sequential_tensor_with_mask(col_memory_mask)
@@ -563,7 +564,7 @@ class LazyMultiHeadAttention(LazyModule):
     def assert_input(self, *inputs):
         pass
 
-    def compute(self, query_list, key_list):
+    def forward(self, query_list, key_list):
         query, query_mask = stack_sequential_tensor_with_mask(query_list)
         key, key_mask = stack_sequential_tensor_with_mask(key_list)
         value, _ = stack_sequential_tensor_with_mask(key_list)
@@ -587,7 +588,7 @@ class LazyBert(LazyModule):
     def assert_input(self, *args):
         pass
 
-    def compute(self, src_list):
+    def forward(self, src_list):
         bsz = len(src_list)
         stacked_src, src_padding_mask = stack_sequential_tensor_with_mask(src_list)
 
@@ -607,7 +608,7 @@ class LazySoftmaxArgmax(LazyModule):
     def assert_input(self, *args):
         pass
 
-    def compute(self, output_prob, target_idx):
+    def forward(self, output_prob, target_idx):
         output_prob_batch = torch.stack(output_prob, dim=0)
         target_idx_batch = torch.stack(target_idx, dim=0).unsqueeze(-1)
 
