@@ -61,7 +61,7 @@ class LazyModule(torch.jit.ScriptModule):
     #     pass
 
 class LazyEmbedding(LazyModule):
-    def __init__(self, num_words, hidden_size, dropout):
+    def __init__(self, num_words, hidden_size, dropout=0.):
         super(LazyEmbedding, self).__init__()
         self.module = nn.Embedding(num_words, hidden_size)
         self.dropout = nn.Dropout(dropout)
@@ -76,8 +76,8 @@ class LazyEmbedding(LazyModule):
         if len(input_seq_list[0].size()) == 1:
             tensor_length = [len(item) for item in input_seq_list]
             stacked_tensors = torch.zeros(
-                len(input_seq_list), max(tensor_length)
-            ).long().cuda()
+                len(input_seq_list), max(tensor_length), device=input_seq_list[0].device
+            ).long()
             for idx, _tensor in enumerate(input_seq_list):
                 stacked_tensors[idx][: len(_tensor)] = _tensor
 
@@ -93,8 +93,8 @@ class LazyEmbedding(LazyModule):
 
         elif len(input_seq_list[0].size()) == 0:
             stacked_tensors = torch.zeros(
-                len(input_seq_list)
-            ).long().cuda()
+                len(input_seq_list), device=input_seq_list[0].device
+            ).long()
             for idx, _tensor in enumerate(input_seq_list):
                 stacked_tensors[idx] = _tensor
 
@@ -131,8 +131,8 @@ class LazyLinear(LazyModule):
         if len(tensor_list[0].size()) == 2:
             tensor_length = [len(item) for item in tensor_list]
             stacked_tensors = torch.zeros(
-                len(tensor_list), max(tensor_length), tensor_list[0].shape[-1]
-            ).cuda()
+                len(tensor_list), max(tensor_length), tensor_list[0].shape[-1], device=tensor_list[0].device
+            )
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx][: len(_tensor)] = _tensor
 
@@ -147,8 +147,8 @@ class LazyLinear(LazyModule):
             ]
         elif len(tensor_list[0].size()) == 1:
             stacked_tensors = torch.zeros(
-                len(tensor_list), tensor_list[0].shape[-1]
-            ).cuda()
+                len(tensor_list), tensor_list[0].shape[-1], device=tensor_list[0].device
+            )
             for idx, _tensor in enumerate(tensor_list):
                 stacked_tensors[idx] = _tensor
 
