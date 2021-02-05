@@ -95,11 +95,11 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
 
     def forward_no_teacher_forcing(self, input_seq_batch, target_seq_batch):
         def embed_encoder_input(state: State, _):
-            return self.embedding.forward_later(state.input_seq)
+            return self.embedding(state.input_seq)
 
         def forward_encoder(state: State, previous_output):
             embedded_tensor = previous_output.result
-            return self.encoder_gru.forward_later(embedded_tensor)
+            return self.encoder_gru(embedded_tensor)
 
         def is_not_complete_output_seq(state: State):
             return state.decoding_cnt < len(state.target_seq)
@@ -115,23 +115,23 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
                 encoder_output, decoder_hidden = previous_output
                 decoder_input = state.decoder_input_token
 
-            decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
+            decoder_input_embedded_promise = self.embedding(decoder_input)
             return encoder_output, decoder_hidden, decoder_input_embedded_promise
 
         def forward_decoder(state: State, previous_output):
             encoder_output, decoder_hidden, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return encoder_output, self.decoder_gru.forward_later(decoder_input_embedded)
+            return encoder_output, self.decoder_gru(decoder_input_embedded)
 
         def compute_attention(state: State, previous_output):
             encoder_output, decoder_hidden_promise = previous_output
             decoder_output, decoder_hidden = decoder_hidden_promise.result
-            return encoder_output, decoder_hidden, self.att.forward_later(decoder_output, encoder_output)
+            return encoder_output, decoder_hidden, self.att(decoder_output, encoder_output)
 
         def compute_output_prob(state: State, previous_output):
             encoder_output, decoder_hidden, attention_promise = previous_output
             attention_output, _ = attention_promise.result
-            output_promise = self.out.forward_later(attention_output)
+            output_promise = self.out(attention_output)
             return encoder_output, decoder_hidden, output_promise
 
         def calc_loss(state: State, previous_output):
@@ -163,11 +163,11 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
 
     def forward_teacher_forcing(self, input_seq_batch, target_seq_batch):
         def embed_encoder_input(state: StateTeacherForcing, _):
-            return self.embedding.forward_later(state.input_seq)
+            return self.embedding(state.input_seq)
 
         def forward_encoder(state: StateTeacherForcing, previous_output):
             embedded_tensor = previous_output.result
-            return self.encoder_gru.forward_later(embedded_tensor)
+            return self.encoder_gru(embedded_tensor)
 
         def embed_decoder_input(state: StateTeacherForcing, previous_output):
             encoder_promise = previous_output
@@ -177,23 +177,23 @@ class GRUSeq2SeqWithAttentionWithBatzzang(nn.Module):
             decoder_hidden = encoder_hidden[:, 0] + encoder_hidden[:, 1]
             decoder_input = state.decoder_input
 
-            decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
+            decoder_input_embedded_promise = self.embedding(decoder_input)
             return encoder_output, decoder_hidden, decoder_input_embedded_promise
 
         def forward_decoder(state: StateTeacherForcing, previous_output):
             encoder_output, decoder_hidden, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return encoder_output, self.decoder_gru.forward_later(decoder_input_embedded)
+            return encoder_output, self.decoder_gru(decoder_input_embedded)
 
         def compute_attention(state: StateTeacherForcing, previous_output):
             encoder_output, decoder_hidden_promise = previous_output
             decoder_output, decoder_hidden = decoder_hidden_promise.result
-            return self.att.forward_later(decoder_output, encoder_output)
+            return self.att(decoder_output, encoder_output)
 
         def compute_output_prob(state: StateTeacherForcing, previous_output):
             attention_promise = previous_output
             attention_output, _ = attention_promise.result
-            output_promise = self.out.forward_later(attention_output)
+            output_promise = self.out(attention_output)
             return output_promise
 
         def calc_loss(state: StateTeacherForcing, previous_output):
@@ -220,6 +220,7 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
     def __init__(self, vocab_num, hidden_size, layer_num, dropout):
         super(TransformerSeq2SeqWithBatzzang, self).__init__()
         self.embedding = LazyEmbedding(vocab_num, hidden_size, dropout)
+        # self.embedding = LazyEmbedding(vocab_num, hidden_size, dropout)
         self.encoder_transformer = LazyTransformerEncoder(hidden_size, nhead=8, dim_feedforward=1024, layer_num=layer_num)
         self.decoder_transformer = LazyTransformerDecoder(hidden_size, nhead=8, dim_feedforward=1024, layer_num=layer_num)
         self.layer_num = layer_num
@@ -234,7 +235,7 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
 
         def forward_encoder(state: State, previous_output):
             embedded_tensor = previous_output.result
-            return self.encoder_transformer.forward_later(embedded_tensor)
+            return self.encoder_transformer(embedded_tensor)
 
         def is_not_complete_output_seq(state: State):
             return state.decoding_cnt < len(state.target_seq)
@@ -248,24 +249,24 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
                 encoder_output = previous_output
                 decoder_input = state.decoder_input_token
 
-            decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
+            decoder_input_embedded_promise = self.embedding(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
         def forward_decoder(state: State, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return encoder_output, self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
+            return encoder_output, self.decoder_transformer(decoder_input_embedded, encoder_output)
 
         def compute_output_prob(state: State, previous_output):
             encoder_output, decoder_output_promise = previous_output
             decoder_output = decoder_output_promise.result
-            output_promise = self.out.forward_later(decoder_output)
+            output_promise = self.out(decoder_output)
             return encoder_output, output_promise
 
         def calc_loss(state: State, previous_output):
             encoder_output, output_promise, = previous_output
             target_idx = state.target_seq[state.decoding_cnt]
-            loss_and_next_token_promise = self.softmax_argmax.forward_later(output_promise.result.squeeze(0), target_idx)
+            loss_and_next_token_promise = self.softmax_argmax(output_promise.result.squeeze(0), target_idx)
             return encoder_output, loss_and_next_token_promise
 
         def update_state(state: State, previous_output):
@@ -295,28 +296,33 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
 
     def forward_teacher_forcing(self, input_seq_batch, target_seq_batch):
         def embed_encoder_input(state:StateTeacherForcing, _):
-            return self.embedding.forward_later(state.input_seq)
+            return self.embedding(state.input_seq)
 
         def forward_encoder(state: StateTeacherForcing, previous_output):
+            return self.out(previous_output.result)
+
             embedded_tensor = previous_output.result
-            return self.encoder_transformer.forward_later(embedded_tensor)
+            return self.encoder_transformer(embedded_tensor)
 
         def embed_decoder_input(state: StateTeacherForcing, previous_output):
+            state.loss = previous_output.result.sum()
+            return None
+
             encoder_promise = previous_output
             encoder_output = encoder_promise.result
             decoder_input = state.decoder_input
-            decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
+            decoder_input_embedded_promise = self.embedding(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
         def forward_decoder(state: StateTeacherForcing, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
+            return self.decoder_transformer(decoder_input_embedded, encoder_output)
 
         def compute_output_prob(state: StateTeacherForcing, previous_output):
             decoder_promise = previous_output
             decoder_output = decoder_promise.result
-            output_promise = self.out.forward_later(decoder_output)
+            output_promise = self.out(decoder_output)
             return output_promise
 
         def calc_loss(state: StateTeacherForcing, previous_output):
@@ -330,9 +336,9 @@ class TransformerSeq2SeqWithBatzzang(nn.Module):
             Do(embed_encoder_input)
             .Then(forward_encoder)
             .Then(embed_decoder_input)
-            .Then(forward_decoder)
-            .Then(compute_output_prob)
-            .Then(calc_loss)
+            # .Then(forward_decoder)
+            # .Then(compute_output_prob)
+            # .Then(calc_loss)
         ).states
 
         return sum([state.loss for state in result_states])
@@ -351,7 +357,7 @@ class BertSeq2SeqWithBatzzang(nn.Module):
 
     def forward_no_teacher_forcing(self, input_seq_batch, target_seq_batch):
         def forward_encoder(state: StateBert, _):
-            return self.encoder.forward_later(state.input_seq)
+            return self.encoder(state.input_seq)
 
         def is_not_complete_output_seq(state: StateBert):
             return state.decoding_cnt < len(state.target_seq)
@@ -365,18 +371,18 @@ class BertSeq2SeqWithBatzzang(nn.Module):
                 encoder_output = previous_output
                 decoder_input = state.decoder_input_token
 
-            decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
+            decoder_input_embedded_promise = self.embedding(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
         def forward_decoder(state: StateBert, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return encoder_output, self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
+            return encoder_output, self.decoder_transformer(decoder_input_embedded, encoder_output)
 
         def compute_output_prob(state: StateBert, previous_output):
             encoder_output, decoder_output_promise = previous_output
             decoder_output = decoder_output_promise.result
-            output_promise = self.out.forward_later(decoder_output)
+            output_promise = self.out(decoder_output)
             return encoder_output, output_promise
 
         def calc_loss(state: StateBert, previous_output):
@@ -410,24 +416,24 @@ class BertSeq2SeqWithBatzzang(nn.Module):
 
     def forward_teacher_forcing(self, input_seq_batch, target_seq_batch):
         def forward_encoder(state: StateTeacherForcingBert, _):
-            return self.encoder.forward_later(state.input_seq)
+            return self.encoder(state.input_seq)
 
         def embed_decoder_input(state: StateTeacherForcingBert, previous_output):
             encoder_promise = previous_output
             encoder_output = encoder_promise.result
             decoder_input = state.decoder_input
-            decoder_input_embedded_promise = self.embedding.forward_later(decoder_input)
+            decoder_input_embedded_promise = self.embedding(decoder_input)
             return encoder_output, decoder_input_embedded_promise
 
         def forward_decoder(state: StateTeacherForcingBert, previous_output):
             encoder_output, decoder_input_embedded_promise = previous_output
             decoder_input_embedded = decoder_input_embedded_promise.result
-            return self.decoder_transformer.forward_later(decoder_input_embedded, encoder_output)
+            return self.decoder_transformer(decoder_input_embedded, encoder_output)
 
         def compute_output_prob(state: StateTeacherForcingBert, previous_output):
             decoder_promise = previous_output
             decoder_output = decoder_promise.result
-            output_promise = self.out.forward_later(decoder_output)
+            output_promise = self.out(decoder_output)
             return output_promise
 
         def calc_loss(state: StateTeacherForcingBert, previous_output):
@@ -462,10 +468,10 @@ def train(input_seq_batch, target_seq_batch, model, optimizer, clip, no_teacher_
     else:
         loss = model.forward_teacher_forcing(input_seq_batch, target_seq_batch)
 
-    # Perform backpropatation
+    # Perform backpropagation
     t1 = time.time()
     loss.backward()
-    print(f"Backward time:{time.time() - t1}")
+    t2 = time.time()
 
     # Clip gradients: gradients are modified in place
     _ = nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -474,9 +480,9 @@ def train(input_seq_batch, target_seq_batch, model, optimizer, clip, no_teacher_
     optimizer.step()
 
     if hasattr(input_seq_batch, "data"):
-        return float(loss) / len(input_seq_batch.data['input_ids'])
+        return float(loss) / len(input_seq_batch.data['input_ids']), t2-t1
     else:
-        return float(loss) / len(input_seq_batch)
+        return float(loss) / len(input_seq_batch), t2-t1
 
 
 def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, no_teacher_forcing):
@@ -490,6 +496,7 @@ def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_ever
     start_iteration = 1
     print_loss = 0
     start_time = time.time()
+    total_backward_time = 0.0
 
     # Training loop
     print("Training...")
@@ -499,14 +506,16 @@ def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_ever
         input_variable, target_variable = training_batch
 
         # Run a training iteration with batch
-        avg_loss = train(input_variable, target_variable, model, optimizer, clip, no_teacher_forcing)
+        avg_loss, backward_time = train(input_variable, target_variable, model, optimizer, clip, no_teacher_forcing)
         print_loss += avg_loss
+        total_backward_time += backward_time
 
         # Print progress
         if iteration % print_every == 0:
             print_loss_avg = print_loss / print_every
             print("Iteration: {}; time: {:.1f}, Percent complete: {:.1f}%; Average loss: {:.4f}".format(iteration, time.time() - start_time, iteration / n_iteration * 100, print_loss_avg))
             print_loss = 0
+    print(f"Backward time:{total_backward_time}")
 
 
 def main():

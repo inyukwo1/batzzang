@@ -468,7 +468,7 @@ def train(input_variable, input_lengths, target_variable, mask, max_target_len, 
     # Perform backpropatation
     t1 = time.time()
     loss.backward()
-    print(f"Backward time:{time.time()-t1}")
+    t2 = time.time()
 
     # Clip gradients: gradients are modified in place
     _ = nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -476,7 +476,7 @@ def train(input_variable, input_lengths, target_variable, mask, max_target_len, 
     # Adjust model weights
     optimizer.step()
 
-    return float(loss) / max_target_len
+    return float(loss) / max_target_len, t2-t1
 
 
 def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_every, clip, no_teacher_forcing):
@@ -490,6 +490,7 @@ def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_ever
     start_iteration = 1
     print_loss = 0
     start_time = time.time()
+    total_backward_time = 0.0
 
     # Training loop
     print("Training...")
@@ -499,14 +500,16 @@ def trainIters(voc, pairs, model, optimizer, n_iteration, batch_size, print_ever
         input_variable, lengths, target_variable, mask, max_target_len = training_batch
 
         # Run a training iteration with batch
-        avg_loss = train(input_variable, lengths, target_variable, mask, max_target_len, model, optimizer, clip, no_teacher_forcing)
+        avg_loss, backward_time = train(input_variable, lengths, target_variable, mask, max_target_len, model, optimizer, clip, no_teacher_forcing)
         print_loss += avg_loss
+        total_backward_time += backward_time
 
         # Print progress
         if iteration % print_every == 0:
             print_loss_avg = print_loss / print_every
             print("Iteration: {}; time: {:.1f}, Percent complete: {:.1f}%; Average loss: {:.4f}".format(iteration, time.time() - start_time, iteration / n_iteration * 100, print_loss_avg))
             print_loss = 0
+    print(f"Backward time:{total_backward_time}")
 
 
 def main():

@@ -1,6 +1,6 @@
 from typing import Callable, Type, Dict, Union, NewType, List, Any
 from abc import ABC
-from .lazy_modules import LazyModule
+from .lazy_modules import LazyModuleTracker
 from . import timer
 
 class State(ABC):
@@ -43,7 +43,7 @@ class Do:
                 callback(state, tensor_dict)
                 for state, tensor_dict in zip(states, list_prev_return)
             ]
-        LazyModule.wait_all()
+        LazyModuleTracker.wait_all()
         return list_new_return
 
 
@@ -92,7 +92,7 @@ class If:
                 callback(state, tensor_dict)
                 for state, tensor_dict in zip(states, list_prev_return)
             ]
-        LazyModule.wait_all()
+        LazyModuleTracker.wait_all()
         return list_new_return
 
 
